@@ -49,32 +49,20 @@ Workflow for every kernel: write the `.cu` file, bind it in `bindings.cpp`, then
   sm_120, not sm_100. The loader in `src/ops.py` handles both. End every kernel wrapper with
   `C10_CUDA_KERNEL_LAUNCH_CHECK()`.
 
-## Phase 3: Profile and Remove Launch Overhead
-
-At 110 tok/s we are ~60% of the bandwidth ceiling. The rest is largely the CPU issuing several hundred
-small kernel launches per token, with the GPU idling between them. Fix this first so later kernel gains
-show up in tok/s.
-
-- **Profile:** `nsys profile` one decode step. Count launches per token and look for GPU idle gaps.
-  On WSL, first enable GPU performance counters (NVIDIA Control Panel → Developer → Manage GPU Performance
-  Counters → allow all users), then `wsl --shutdown`.
-- **Stronger bar:** add a `torch.compile` row to the benchmark, so we know whether we beat a good baseline or
-  only a naive one.
-- **CUDA graphs:** capture one decode step and replay it. This needs static shapes: attend over the full
-  preallocated KV cache with a length mask instead of a growing slice.
-- **Goal:** ≥ 140 tok/s with plain PyTorch ops, and still PASS.
-
-## Phase 4: Fused Elementwise Kernels
+## Phase 3: Fused Elementwise Kernels
 
 PyTorch runs RMSNorm as ~6 separate kernels, each reading and writing VRAM. Fusing keeps intermediates in
 registers.
 
+- **Profile first:** `nsys profile` one decode step to see where GPU time goes and how many launches each
+  token costs. On WSL, first enable GPU performance counters (NVIDIA Control Panel → Developer → Manage GPU
+  Performance Counters → allow all users), then `wsl --shutdown`. Nsight Compute needs this too.
 - **Kernels:** `rms_norm` (one block per row, warp-shuffle reduction, fp32 accumulation), `silu_mul`,
   `rope`, then a new fused op `add_rms_norm` (residual add + norm in one pass). Llama has no norm bias.
-- **Goal:** each kernel ≥ 3x faster than PyTorch in `test_ops.py`, and measurable end-to-end gain on top of
-  Phase 3.
+- **Goal:** each kernel ≥ 3x faster than PyTorch in `test_ops.py`. Expect modest end-to-end gains for now:
+  launch overhead hides much of the improvement until Phase 7.
 
-## Phase 5: Bandwidth-Bound GEMV for Decode
+## Phase 4: Bandwidth-Bound GEMV for Decode
 
 During decode every matmul has M = 1, so each weight is used exactly once and there is no reuse for tiling
 to exploit. Speed comes from streaming weights at full bandwidth.
@@ -83,9 +71,9 @@ to exploit. Speed comes from streaming weights at full bandwidth.
   and enough blocks to saturate every SM.
 - **Weight layout:** concatenate q/k/v and gate/up at load time (in `BlackwellOptimizedLLM.__init__`) so each
   input is read once and there are fewer launches. Fuse `silu_mul` into the gate/up GEMV output.
-- **Goal:** ≥ 80% of 448 GB/s on decode shapes in `test_ops.py`; **≥ 150 tok/s end-to-end**.
+- **Goal:** ≥ 80% of 448 GB/s on decode shapes in `test_ops.py`. The ≥ 150 tok/s end-to-end target lands in Phase 7.
 
-## Phase 6: Tiled GEMM for Prefill
+## Phase 5: Tiled GEMM for Prefill
 
 With a long prompt, each weight is reused across every prompt token, so prefill is compute-bound and tiling
 pays off. This shows up in TTFT.
@@ -96,9 +84,9 @@ pays off. This shows up in TTFT.
   async copies. `linear` dispatches to GEMV when M = 1 and GEMM otherwise.
 - **Tuning:** use Nsight Compute to remove bank conflicts and raise tensor-core utilization.
 - **Goal:** ≥ 50% of cuBLAS throughput at M = 512. cuBLAS is tuned by NVIDIA, so beating it is a stretch goal.
-  The point of this phase is the skills Phase 7 needs.
+  The point of this phase is the skills Phase 6 needs.
 
-## Phase 7: On-the-Fly Dequantization
+## Phase 6: On-the-Fly Dequantization
 
 This is where we pass the fp16 ceiling: fewer bytes per weight means more tokens per second, and freed VRAM
 allows longer contexts.
@@ -112,3 +100,13 @@ allows longer contexts.
   then inside the tiled GEMM for prefill.
 - **Quality gate:** top-1 agreement with HF ≥ 95% under teacher forcing, and readable greedy output.
 - **Goal:** **≥ 230 tok/s (int8), ≥ 300 tok/s (int4)**, i.e. 2–2.7x faster decode than HF.
+
+## Phase 7: CUDA Graphs and the Final Comparison
+
+With all the kernels written, remove the remaining CPU overhead and measure against strong baselines.
+
+- **CUDA graphs:** capture one decode step and replay it, so hundreds of launches become one. This needs static
+  shapes: attend over the full preallocated KV cache with a length mask instead of a growing slice.
+- **Stronger bars:** add `torch.compile` (automatic fusion + CUDA graphs) to the benchmark, and compare with
+  llama.cpp at matching quantization on the same GPU.
+- **Goal:** hit the target table: **≥ 150 tok/s fp16, ≥ 300 tok/s int4**, ahead of `torch.compile`.
