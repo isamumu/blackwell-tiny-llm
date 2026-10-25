@@ -20,8 +20,8 @@
 // Any name not defined here falls back to PyTorch, so you can do one at a time.
 // Then run: python benchmarks/test_ops.py && python benchmarks/test_baseline.py
 
-// torch::Tensor rms_norm_cuda(torch::Tensor x, torch::Tensor weight, double eps);
+torch::Tensor rms_norm_cuda(torch::Tensor x, torch::Tensor weight, double eps);
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    // m.def("rms_norm", &rms_norm_cuda, "Fused RMSNorm");
+    m.def("rms_norm", &rms_norm_cuda, "Fused RMSNorm");
 }

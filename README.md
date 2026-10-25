@@ -51,12 +51,14 @@ Workflow for every kernel: write the `.cu` file, bind it in `bindings.cpp`, then
 
 ## Phase 3: Fused Elementwise Kernels
 
-PyTorch runs RMSNorm as ~6 separate kernels, each reading and writing VRAM. Fusing keeps intermediates in
+PyTorch runs RMSNorm as ~8 separate kernels, each reading and writing VRAM. Fusing keeps intermediates in
 registers.
 
-- **Profile first:** `nsys profile` one decode step to see where GPU time goes and how many launches each
-  token costs. On WSL, first enable GPU performance counters (NVIDIA Control Panel → Developer → Manage GPU
-  Performance Counters → allow all users), then `wsl --shutdown`. Nsight Compute needs this too.
+- **Profile first:** profile one decode step to see where GPU time goes and how many launches each token
+  costs. Start with `torch.profiler` (per-op table: which PyTorch op launched which kernels), and use
+  `nsys profile` when you need the full timeline (CPU launch gaps, GPU idle time). On WSL, first enable GPU
+  performance counters (NVIDIA Control Panel → Developer → Manage GPU Performance Counters → allow all users),
+  then `wsl --shutdown`. Nsight Compute needs this too.
 - **Kernels:** `rms_norm` (one block per row, warp-shuffle reduction, fp32 accumulation), `silu_mul`,
   `rope`, then a new fused op `add_rms_norm` (residual add + norm in one pass). Llama has no norm bias.
 - **Goal:** each kernel ≥ 3x faster than PyTorch in `test_ops.py`. Expect modest end-to-end gains for now:
@@ -110,3 +112,23 @@ With all the kernels written, remove the remaining CPU overhead and measure agai
 - **Stronger bars:** add `torch.compile` (automatic fusion + CUDA graphs) to the benchmark, and compare with
   llama.cpp at matching quantization on the same GPU.
 - **Goal:** hit the target table: **≥ 150 tok/s fp16, ≥ 300 tok/s int4**, ahead of `torch.compile`.
+
+## Phase 8 (Optional): Long Context
+
+At the benchmark's ~177 tokens, attention is ~0.2% of decode time. At long contexts it becomes a real share,
+and the int4 weights from Phase 6 free enough VRAM to reach the model's full 128K window on an 8GB card.
+
+| Context | KV cache (fp16, 32 KB/token) | Fits with fp16 weights? | Fits with int4 weights? |
+|---|---|---|---|
+| 32K | 1 GB | yes | yes |
+| 64K | 2 GB | yes | yes |
+| 128K | 4 GB | no (~6.85 GB free) | yes; comfortable with int8 KV |
+
+- **Chunked prefill:** feed long prompts in chunks (e.g. 2K tokens) so the MLP's temporary buffers stay small.
+  `ops.attention` must then handle a query chunk attending to everything already cached (an offset causal
+  mask instead of SDPA's `is_causal`). Raise `max_seq_len` accordingly.
+- **Benchmark:** add a long-context mode to `test_baseline.py` that reports decode tok/s at 8K / 32K / 128K.
+  Beyond ~32K, check correctness against saved HF reference outputs, since HF's own KV cache adds another copy.
+- **Kernels:** flash-decoding (split the KV length across blocks so all SMs work on a single query, then merge
+  the partial softmax results), an int8 KV cache (half the bytes and VRAM), and RoPE fused into the KV-cache write.
+- **Goal:** decode tok/s at 32K beats PyTorch SDPA, and a 128K context runs end-to-end on the 8GB card.
