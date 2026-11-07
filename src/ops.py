@@ -16,7 +16,7 @@ import torch.nn.functional as F
 
 CUDA_DIR = Path(__file__).resolve().parent / "cuda"
 
-OP_NAMES = ["rms_norm", "linear", "silu_mul", "rope", "attention"]
+OP_NAMES = ["rms_norm", "add_rms_norm", "linear", "silu_mul", "rope", "attention"]
 
 
 # ---------------------------------------------------------------------------
@@ -29,6 +29,13 @@ def rms_norm(x, weight, eps):
     x32 = x.float()
     x32 = x32 * torch.rsqrt(x32.pow(2).mean(-1, keepdim=True) + eps)
     return weight * x32.to(x.dtype)
+
+
+def add_rms_norm(x, residual, weight, eps):
+    """Fused residual add + RMSNorm. x, residual: [..., hidden] fp16, weight: [hidden] fp16
+    -> (normed, new_residual) where new_residual = residual + x and normed = rms_norm(new_residual)."""
+    residual = residual + x
+    return rms_norm(residual, weight, eps), residual
 
 
 def linear(x, weight):

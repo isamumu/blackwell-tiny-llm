@@ -123,11 +123,16 @@ class BlackwellOptimizedLLM:
         T = input_ids.shape[1]
         cos, sin = self._rope_tables(cache.len, T)
 
-        x = F.embedding(input_ids, self.embed)
+        # Residual stream: each residual add is fused with the norm that follows it,
+        # so a layer's input norm happens at the end of the previous layer.
+        residual = F.embedding(input_ids, self.embed)
+        h = ops.rms_norm(residual, self.layers[0].input_norm, self.eps)  # first norm has no add before it
         for i, w in enumerate(self.layers):
-            x = x + self._attention(ops.rms_norm(x, w.input_norm, self.eps), w, cos, sin, cache, i)
-            x = x + self._mlp(ops.rms_norm(x, w.post_norm, self.eps), w)
+            attn = self._attention(h, w, cos, sin, cache, i)
+            h, residual = ops.add_rms_norm(attn, residual, w.post_norm, self.eps)
+            mlp = self._mlp(h, w)
+            next_norm = self.layers[i + 1].input_norm if i + 1 < len(self.layers) else self.final_norm
+            h, residual = ops.add_rms_norm(mlp, residual, next_norm, self.eps)
         cache.len += T
 
-        x = ops.rms_norm(x[:, -1], self.final_norm, self.eps)
-        return ops.linear(x, self.lm_head)
+        return ops.linear(h[:, -1], self.lm_head)  # h is already final-normed

@@ -21,7 +21,13 @@
 // Then run: python benchmarks/test_ops.py && python benchmarks/test_baseline.py
 
 torch::Tensor rms_norm_cuda(torch::Tensor x, torch::Tensor weight, double eps);
+torch::Tensor silu_mul_cuda(torch::Tensor gate, torch::Tensor up);
+std::tuple<torch::Tensor, torch::Tensor> rope_cuda(torch::Tensor q, torch::Tensor k, torch::Tensor cos, torch::Tensor sin);
+std::tuple<torch::Tensor, torch::Tensor> add_rms_norm_cuda(torch::Tensor x, torch::Tensor residual, torch::Tensor weight, double eps);
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("rms_norm", &rms_norm_cuda, "Fused RMSNorm");
+    m.def("rms_norm", &rms_norm_cuda, "Fused RMSNorm"); 
+    m.def("silu_mul", &silu_mul_cuda, "Fused SwiGLU");
+    m.def("rope", &rope_cuda, "Fused RoPE");
+    m.def("add_rms_norm", &add_rms_norm_cuda, "Fused Add RMSNorm");
 }
