@@ -8,17 +8,22 @@
 // 1. The Device Code (Runs on GPU threads)
 __global__ void linear_kernel(half* out, const half* x, const half* weight,
                               const int rows, const int in_features, const int out_features) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= rows * out_features) return;
+    int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / 32;   // global warp number → n
+    int lane    = threadIdx.x % 32;                                // 0..31 within the warp
 
-    int row = idx / out_features; // out_features is how many rows there are for weights
-    int col = idx % out_features;
+    if (warp_id >= out_features) return;
+
+    
+    const half* w_row = weight + warp_id * in_features;
     float sum = 0.0f;
-    for (int k = 0; k < in_features; ++k) {
-        sum += __half2float(x[row * in_features + k]) *
-               __half2float(weight[col * in_features + k]);
-    }
-    out[row * out_features + col] = __float2half(sum);
+    for (int k = lane; k < in_features; k += 32)
+        sum += __half2float(x[k]) * __half2float(w_row[k]);
+
+    for (int offset = 16; offset > 0; offset /= 2)
+        sum += __shfl_down_sync(0xffffffff, sum, offset);
+
+    if (lane == 0)
+        out[warp_id] = __float2half(sum);
 
 }
 
@@ -36,10 +41,13 @@ torch::Tensor linear_cuda(torch::Tensor x, torch::Tensor weight) {
     x = x.contiguous();
     weight = weight.contiguous();
 
-    auto out = torch::empty({x.numel() / in_features, out_features}, x.options());
     const int rows = x.numel() / in_features;
-    int threads = 256;
-    int blocks = (rows * out_features + threads - 1) / threads;
+    auto out = torch::empty({rows, out_features}, x.options());
+    if (rows != 1) return at::linear(x, weight);      // GEMV only; prefill → PyTorch
+
+    int threads = 256;                                 // 8 warps per block
+    int warps_per_block = threads / 32;
+    int blocks = (out_features + warps_per_block - 1) / warps_per_block;
 
     linear_kernel<<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
         reinterpret_cast<half*>(out.data_ptr<at::Half>()),
