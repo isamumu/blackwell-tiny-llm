@@ -49,35 +49,24 @@ Workflow for every kernel: write the `.cu` file, bind it in `bindings.cpp`, then
   sm_120, not sm_100. The loader in `src/ops.py` handles both. End every kernel wrapper with
   `C10_CUDA_KERNEL_LAUNCH_CHECK()`.
 
-## Phase 3: Fused Elementwise Kernels
+## Phase 3: Fused Elementwise Kernels ✅
 
-PyTorch runs RMSNorm as ~8 separate kernels, each reading and writing VRAM. Fusing keeps intermediates in
-registers.
+- `benchmarks/profile_decode.py`: step latency, effective bandwidth, NVML readings and a `torch.profiler` table
+  for one backend's decode steps. On WSL, GPU performance counters must be enabled first (NVIDIA Control Panel →
+  Developer → Manage GPU Performance Counters → allow all users, then `wsl --shutdown`); `nsys` and Nsight
+  Compute need this too.
+- Kernels: `rms_norm` (one block per row, warp-shuffle reduction, fp32 accumulation), `silu_mul`, `rope`, and
+  the fused `add_rms_norm` (residual add + norm in one pass, so each layer's input norm runs at the end of the
+  previous layer).
+- Speedups vs PyTorch in `test_ops.py`: **rms_norm ~6x, add_rms_norm ~7x, rope ~7–9x, silu_mul ~2x decode /
+  1.4x prefill**.
 
-- **Profile first:** profile one decode step to see where GPU time goes and how many launches each token
-  costs. Start with `torch.profiler` (per-op table: which PyTorch op launched which kernels), and use
-  `nsys profile` when you need the full timeline (CPU launch gaps, GPU idle time). On WSL, first enable GPU
-  performance counters (NVIDIA Control Panel → Developer → Manage GPU Performance Counters → allow all users),
-  then `wsl --shutdown`. Nsight Compute needs this too.
-- **Kernels:** `rms_norm` (one block per row, warp-shuffle reduction, fp32 accumulation), `silu_mul`,
-  `rope`, then a new fused op `add_rms_norm` (residual add + norm in one pass). Llama has no norm bias.
-- **Goal:** each kernel ≥ 3x faster than PyTorch in `test_ops.py`. Expect modest end-to-end gains for now:
-  launch overhead hides much of the improvement until Phase 7.
+## Phase 4: Bandwidth-Bound GEMV for Decode ✅
 
-## Phase 4: Bandwidth-Bound GEMV for Decode
-
-During decode every matmul has M = 1, so each weight is used exactly once and there is no reuse for tiling
-to exploit. Speed comes from streaming weights at full bandwidth.
-
-- **Kernels:** a `linear` GEMV with coalesced 128-bit vectorized loads (`half2`/`float4`), warp-level reduction,
-  and enough blocks to saturate every SM.
-- **Weight layout:** concatenate q/k/v and gate/up at load time (in `BlackwellOptimizedLLM.__init__`) so each
-  input is read once and there are fewer launches. Fuse `silu_mul` into the gate/up GEMV output.
-- **Goal:** ≥ 80% of 448 GB/s on decode shapes in `test_ops.py`. The ≥ 150 tok/s end-to-end target lands in Phase 7.
-
-**Progress so far:** `linear` (one warp per output, `float4` loads, warp-shuffle reduction) + fused q/k/v.
-**144 tok/s decode** (from 138), logits still PASS vs HF. gate/up concat + `silu_mul` fusion still to do.
-
+- `linear` GEMV: one warp per output row, `float4` (128-bit) loads, fp32 accumulation, warp-shuffle reduction.
+  Prefill and unaligned inputs fall back to PyTorch.
+- q/k/v weights concatenated at load time into one `wqkv`, so attention does one GEMV instead of three.
+- **144 tok/s decode** (from 138), logits PASS vs HF.
 - **Measure with a cold L2.** `test_ops.py` reuses one weight, so shapes ≤ 32 MB stay in L2 and report
   impossible numbers (~870 GB/s). Cycling through >256 MB of weight copies gives the real figure.
 - **The plain warp-per-row kernel was already bandwidth-bound.** Even with 16-bit loads it hit ~400 GB/s on the
