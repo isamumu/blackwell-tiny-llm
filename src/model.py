@@ -18,9 +18,7 @@ from src.ops import make_ops
 @dataclass
 class LayerWeights:
     input_norm: torch.Tensor  # [hidden]
-    wq: torch.Tensor          # [n_heads * head_dim, hidden]
-    wk: torch.Tensor          # [n_kv_heads * head_dim, hidden]
-    wv: torch.Tensor          # [n_kv_heads * head_dim, hidden]
+    wqkv: torch.Tensor        # [(n_heads + 2 * n_kv_heads) * head_dim, hidden]: q, k, v rows stacked
     wo: torch.Tensor          # [hidden, n_heads * head_dim]
     post_norm: torch.Tensor   # [hidden]
     w_gate: torch.Tensor      # [intermediate, hidden]
@@ -74,9 +72,10 @@ class BlackwellOptimizedLLM:
         self.layers = [
             LayerWeights(
                 input_norm=l.input_layernorm.weight,
-                wq=l.self_attn.q_proj.weight,
-                wk=l.self_attn.k_proj.weight,
-                wv=l.self_attn.v_proj.weight,
+                # one GEMV reads h once and fills the GPU better than three small ones (k/v are only 512 rows).
+                # torch.cat copies, so this costs ~12 MB per layer on top of HF's weights.
+                wqkv=torch.cat([l.self_attn.q_proj.weight, l.self_attn.k_proj.weight,
+                                l.self_attn.v_proj.weight], dim=0),
                 wo=l.self_attn.o_proj.weight,
                 post_norm=l.post_attention_layernorm.weight,
                 w_gate=l.mlp.gate_proj.weight,
@@ -102,9 +101,11 @@ class BlackwellOptimizedLLM:
     def _attention(self, h, w, cos, sin, cache, layer):
         ops = self.ops
         B, T, _ = h.shape
-        q = ops.linear(h, w.wq).view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
-        k = ops.linear(h, w.wk).view(B, T, self.n_kv_heads, self.head_dim).transpose(1, 2)
-        v = ops.linear(h, w.wv).view(B, T, self.n_kv_heads, self.head_dim).transpose(1, 2)
+        q_dim, kv_dim = self.n_heads * self.head_dim, self.n_kv_heads * self.head_dim
+        q, k, v = ops.linear(h, w.wqkv).split([q_dim, kv_dim, kv_dim], dim=-1)
+        q = q.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
+        k = k.view(B, T, self.n_kv_heads, self.head_dim).transpose(1, 2)
+        v = v.view(B, T, self.n_kv_heads, self.head_dim).transpose(1, 2)
         q, k = ops.rope(q, k, cos, sin)
         k, v = cache.update(layer, k, v)
         o = ops.attention(q, k, v)

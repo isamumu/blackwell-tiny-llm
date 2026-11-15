@@ -75,6 +75,19 @@ to exploit. Speed comes from streaming weights at full bandwidth.
   input is read once and there are fewer launches. Fuse `silu_mul` into the gate/up GEMV output.
 - **Goal:** ≥ 80% of 448 GB/s on decode shapes in `test_ops.py`. The ≥ 150 tok/s end-to-end target lands in Phase 7.
 
+**Progress so far:** `linear` (one warp per output, `float4` loads, warp-shuffle reduction) + fused q/k/v.
+**144 tok/s decode** (from 138), logits still PASS vs HF. gate/up concat + `silu_mul` fusion still to do.
+
+- **Measure with a cold L2.** `test_ops.py` reuses one weight, so shapes ≤ 32 MB stay in L2 and report
+  impossible numbers (~870 GB/s). Cycling through >256 MB of weight copies gives the real figure.
+- **The plain warp-per-row kernel was already bandwidth-bound.** Even with 16-bit loads it hit ~400 GB/s on the
+  big layers; lm_head tops out at ~420 GB/s (~94% of 448), which is the practical ceiling on this card.
+- **Kept the simple design on purpose.** Staging `x` in shared memory and splitting rows across several warps
+  measured within noise (±5%), so they were dropped. `float4` loads stay: they cost a few lines and matter
+  once int8/int4 dequant makes the kernel instruction-bound.
+- **The win came from fewer launches, not faster GEMVs.** Fusing q/k/v turns three launches into one and gets
+  rid of the 512-row k/v GEMVs, which were too small to fill 30 SMs (~190 GB/s).
+
 ## Phase 5: Tiled GEMM for Prefill
 
 With a long prompt, each weight is reused across every prompt token, so prefill is compute-bound and tiling

@@ -28,7 +28,7 @@ def make_inputs(op, T):
     if op == "add_rms_norm":
         return [(h(1, T, HIDDEN), h(1, T, HIDDEN), h(HIDDEN), 1e-5)]
     if op == "linear":
-        return [(h(1, T, HIDDEN), h(N, HIDDEN) * 0.02) for N in (HIDDEN, INTER)] + [(h(1, T, INTER), h(HIDDEN, INTER) * 0.02)]
+        return [(h(1, T, HIDDEN), h(N, HIDDEN) * 0.02) for N in (HIDDEN, (N_HEADS + 2 * N_KV) * HEAD_DIM, INTER)] + [(h(1, T, INTER), h(HIDDEN, INTER) * 0.02)]
     if op == "silu_mul":
         return [(h(1, T, INTER), h(1, T, INTER))]
     if op == "rope":
