@@ -77,20 +77,7 @@ Workflow for every kernel: write the `.cu` file, bind it in `bindings.cpp`, then
 - **The win came from fewer launches, not faster GEMVs.** Fusing q/k/v turns three launches into one and gets
   rid of the 512-row k/v GEMVs, which were too small to fill 30 SMs (~190 GB/s).
 
-## Phase 5: Tiled GEMM for Prefill
-
-With a long prompt, each weight is reused across every prompt token, so prefill is compute-bound and tiling
-pays off. This shows up in TTFT.
-
-- **Benchmark:** add a long-prompt mode (e.g. 512–2048 tokens) to `test_baseline.py`. The 49-token prompt is
-  too short to stress prefill.
-- **Kernels:** shared-memory tiled GEMM → register tiling → tensor cores (`mma` instructions) → double-buffered
-  async copies. `linear` dispatches to GEMV when M = 1 and GEMM otherwise.
-- **Tuning:** use Nsight Compute to remove bank conflicts and raise tensor-core utilization.
-- **Goal:** ≥ 50% of cuBLAS throughput at M = 512. cuBLAS is tuned by NVIDIA, so beating it is a stretch goal.
-  The point of this phase is the skills Phase 6 needs.
-
-## Phase 6: On-the-Fly Dequantization
+## Phase 5: On-the-Fly Dequantization
 
 This is where we pass the fp16 ceiling: fewer bytes per weight means more tokens per second, and freed VRAM
 allows longer contexts.
@@ -100,12 +87,13 @@ allows longer contexts.
 - **Reference first:** add a PyTorch dequantize-then-matmul reference in `ops.py`. Then the benchmark
   separates the two error sources: **torch vs hf** = quantization error (tune the scheme),
   **custom vs torch** = kernel error (should be ~0).
-- **Kernels:** dequantize inside the GEMV (unpack to fp16 in registers, never write fp16 weights back to VRAM),
-  then inside the tiled GEMM for prefill.
+- **Kernels:** dequantize inside the GEMV (unpack to fp16 in registers, never write fp16 weights back to VRAM).
+  For prefill, dequantize one layer's weights into a reused fp16 buffer (≤ 32 MB) and call cuBLAS: prefill is
+  compute-bound, so the extra pass is amortized over the prompt.
 - **Quality gate:** top-1 agreement with HF ≥ 95% under teacher forcing, and readable greedy output.
 - **Goal:** **≥ 230 tok/s (int8), ≥ 300 tok/s (int4)**, i.e. 2–2.7x faster decode than HF.
 
-## Phase 7: CUDA Graphs and the Final Comparison
+## Phase 6: CUDA Graphs and the Final Comparison
 
 With all the kernels written, remove the remaining CPU overhead and measure against strong baselines.
 
@@ -115,10 +103,12 @@ With all the kernels written, remove the remaining CPU overhead and measure agai
   llama.cpp at matching quantization on the same GPU.
 - **Goal:** hit the target table: **≥ 150 tok/s fp16, ≥ 300 tok/s int4**, ahead of `torch.compile`.
 
-## Phase 8 (Optional): Long Context
+## Phase 7 (Optional): Long Context
 
 At the benchmark's ~177 tokens, attention is ~0.2% of decode time. At long contexts it becomes a real share,
-and the int4 weights from Phase 6 free enough VRAM to reach the model's full 128K window on an 8GB card.
+and the int4 weights from Phase 5 free enough VRAM to reach the model's full 128K window on an 8GB card.
+Do this after Phases 5 and 6: it needs the int4 weights to fit 128K, and builds on Phase 6's attention over the
+full preallocated KV cache with a length mask.
 
 | Context | KV cache (fp16, 32 KB/token) | Fits with fp16 weights? | Fits with int4 weights? |
 |---|---|---|---|
